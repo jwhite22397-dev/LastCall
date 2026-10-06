@@ -60,6 +60,14 @@ export class UIScene extends Phaser.Scene {
   private joystickStick!: HTMLDivElement;
   private joystickActive = false;
   private joystickCenter = { x: 0, y: 0 };
+  private choosingUpgrade = false;
+  private readonly onUpgradeKey = (event: KeyboardEvent): void => {
+    if (!this.choosingUpgrade) return;
+    const index = Number(event.key) - 1;
+    if (index < 0 || index > 2) return;
+    const card = this.upgradeOverlay.querySelectorAll('.upgrade-card')[index] as HTMLElement | undefined;
+    card?.click();
+  };
   
   constructor() {
     super({ key: 'UIScene' });
@@ -313,7 +321,9 @@ export class UIScene extends Phaser.Scene {
       cardsContainer.appendChild(card);
     }
     
+    this.choosingUpgrade = true;
     this.upgradeOverlay.classList.add('visible');
+    window.addEventListener('keydown', this.onUpgradeKey);
   }
   
   private createUpgradeCard(choice: UpgradeChoice): HTMLDivElement {
@@ -350,6 +360,9 @@ export class UIScene extends Phaser.Scene {
   }
   
   private selectUpgrade(choice: UpgradeChoice): void {
+    if (!this.choosingUpgrade) return;
+    this.choosingUpgrade = false;
+    window.removeEventListener('keydown', this.onUpgradeKey);
     this.upgradeOverlay.classList.remove('visible');
     (this.gameScene as GameScene).selectUpgrade(choice.type, choice.id, choice.level);
   }
@@ -490,7 +503,8 @@ export class UIScene extends Phaser.Scene {
   }
   
   shutdown(): void {
-    // Clean up
+    this.choosingUpgrade = false;
+    window.removeEventListener('keydown', this.onUpgradeKey);
     this.uiOverlay.innerHTML = '';
     this.gameScene.events.off('stateUpdate', this.onStateUpdate, this);
     this.gameScene.events.off('levelUp', this.onLevelUp, this);

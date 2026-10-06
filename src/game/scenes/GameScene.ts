@@ -2002,19 +2002,28 @@ export class GameScene extends Phaser.Scene {
     const choices = this.generateUpgradeChoices(3);
     if (choices.length === 0) {
       this.pendingLevels = 0;
-      this.runState.isLevelingUp = false;
-      if (!this.runEnded) {
-        this.physics.resume();
-        audioService.setMusicPaused(false);
-      }
+      this.finishLevelUp();
       return;
     }
     
     this.runState.isLevelingUp = true;
-    this.physics.pause();
     audioService.setMusicPaused(true);
+    // addXP runs inside arcade overlap callbacks. Pausing physics in that
+    // stack can leave the world stuck, so pause on the next tick instead.
+    this.time.delayedCall(0, () => {
+      if (this.runState.isLevelingUp && !this.runEnded) {
+        this.physics.pause();
+      }
+    });
     this.events.emit('levelUp', this.runState.level, choices);
     audioService.play('levelUp');
+  }
+
+  private finishLevelUp(): void {
+    this.runState.isLevelingUp = false;
+    if (this.runEnded || this.runState.isPaused) return;
+    this.physics.resume();
+    audioService.setMusicPaused(false);
   }
   
   private generateUpgradeChoices(count: number): Array<{ type: 'weapon' | 'upgrade'; id: string; level: number }> {
@@ -2090,54 +2099,51 @@ export class GameScene extends Phaser.Scene {
   }
   
   selectUpgrade(type: 'weapon' | 'upgrade', id: string, level: number): void {
-    if (type === 'weapon') {
-      // Check if this is an evolution
-      const weapon = getWeapon(id);
-      if (weapon) {
-        // Check if we're evolving from another weapon
-        const evolvingFrom = WEAPONS.find(w => w.evolutionId === id);
-        if (evolvingFrom && this.runState.weapons.has(evolvingFrom.id)) {
-          this.runState.weapons.delete(evolvingFrom.id);
-          saveService.addToStats('weaponEvolutions', 1);
-          this.events.emit('weaponEvolved', weapon.name);
-          audioService.play('evolve');
+    if (!this.runState.isLevelingUp || this.runEnded) return;
+    try {
+      if (type === 'weapon') {
+        const weapon = getWeapon(id);
+        if (weapon) {
+          const evolvingFrom = WEAPONS.find(w => w.evolutionId === id);
+          if (evolvingFrom && this.runState.weapons.has(evolvingFrom.id)) {
+            this.runState.weapons.delete(evolvingFrom.id);
+            saveService.addToStats('weaponEvolutions', 1);
+            this.events.emit('weaponEvolved', weapon.name);
+            audioService.play('evolve');
+          }
         }
-      }
-      
-      this.runState.weapons.set(id, level);
-      if (weapon && level >= weapon.maxLevel) this.reachedMaxWeapon = true;
-      
-      // Update orbitals if needed
-      if (weapon?.category === 'orbital') {
-        this.updateOrbitals();
-      }
-    } else {
-      this.runState.passives.set(id, level);
-      
-      // Apply immediate effects
-      const upgrade = getUpgrade(id);
-      if (upgrade) {
-        for (const effect of upgrade.effects) {
-          if (effect.stat === 'maxHealth') {
-            const bonus = effect.isPercent
-              ? this.runState.maxHealth * effect.value
-              : effect.value;
-            this.runState.maxHealth = Math.max(20, this.runState.maxHealth + bonus);
-            this.runState.health = Math.max(1, Math.min(this.runState.maxHealth, this.runState.health + bonus));
+        
+        this.runState.weapons.set(id, level);
+        if (weapon && level >= weapon.maxLevel) this.reachedMaxWeapon = true;
+        
+        if (weapon?.category === 'orbital') {
+          this.updateOrbitals();
+        }
+      } else {
+        this.runState.passives.set(id, level);
+        
+        const upgrade = getUpgrade(id);
+        if (upgrade) {
+          for (const effect of upgrade.effects) {
+            if (effect.stat === 'maxHealth') {
+              const bonus = effect.isPercent
+                ? this.runState.maxHealth * effect.value
+                : effect.value;
+              this.runState.maxHealth = Math.max(20, this.runState.maxHealth + bonus);
+              this.runState.health = Math.max(1, Math.min(this.runState.maxHealth, this.runState.health + bonus));
+            }
           }
         }
       }
+    } finally {
+      this.pendingLevels = Math.max(0, this.pendingLevels - 1);
+      if (this.pendingLevels > 0) {
+        this.levelUp();
+      } else {
+        this.finishLevelUp();
+      }
+      audioService.play('select');
     }
-    
-    this.pendingLevels = Math.max(0, this.pendingLevels - 1);
-    if (this.pendingLevels > 0) {
-      this.levelUp();
-    } else {
-      this.runState.isLevelingUp = false;
-      this.physics.resume();
-      audioService.setMusicPaused(false);
-    }
-    audioService.play('select');
   }
   
   private getStatMultiplier(stat: string): number {

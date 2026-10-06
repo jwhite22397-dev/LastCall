@@ -115,7 +115,21 @@
       z-index: 100;
     }
 
+    /* Direct children default to none so hidden full-screen layers
+       (pause, results) cannot swallow clicks meant for the cards.
+       An id+element rule beats a lone class, so the opt-in list below
+       repeats the #ui-overlay prefix. */
     #ui-overlay > * {
+      pointer-events: none;
+    }
+
+    #ui-overlay > .menu-overlay,
+    #ui-overlay > .upgrade-overlay.visible,
+    #ui-overlay > .pause-overlay.visible,
+    #ui-overlay > .results-overlay.visible,
+    #ui-overlay > .debug-panel.visible,
+    #ui-overlay > .joystick-container,
+    #ui-overlay .pause-btn {
       pointer-events: auto;
     }
 
@@ -244,6 +258,7 @@
     .upgrade-overlay.visible {
       opacity: 1;
       pointer-events: auto;
+      z-index: 360;
     }
 
     .upgrade-title {
