@@ -1,0 +1,25 @@
+{
+  "name": "last-call",
+  "version": "1.0.0",
+  "description": "LAST CALL - A fast, addictive top-down action roguelite set inside an increasingly chaotic nightclub",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "phaser": "^3.80.0",
+    "typescript": "^5.4.0",
+    "vite": "^5.4.0",
+    "vitest": "^1.6.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jwhite22397-dev/LastCall.git"
+  },
+  "license": "ISC"
+}
