@@ -3,11 +3,13 @@ import {
   applyArmor,
   calculateClout,
   critMultiplier,
+  distanceToSegment,
   formatClock,
   upgradeCost,
   weightedIndex,
   xpToNextLevel,
 } from '../game/balance/formulas';
+import { synergyActive } from '../game/balance/synergies';
 import { metAchievement, newlyMetAchievements } from '../game/balance/achievements';
 
 const emptyRun = {
@@ -69,10 +71,27 @@ describe('combat formulas', () => {
     expect(upgradeCost(100, 2)).toBeGreaterThan(upgradeCost(100, 1));
   });
 
+  it('measures distance to a beam segment', () => {
+    expect(distanceToSegment(0, 1, 0, 0, 10, 0)).toBeCloseTo(1);
+    expect(distanceToSegment(5, 0, 0, 0, 10, 0)).toBeCloseTo(0);
+    expect(distanceToSegment(-2, 0, 0, 0, 10, 0)).toBeCloseTo(2);
+  });
+
   it('picks a weighted index from a 0-1 roll', () => {
     expect(weightedIndex([1, 1, 1], 0)).toBe(0);
     expect(weightedIndex([1, 1, 1], 0.9)).toBe(2);
     expect(weightedIndex([10, 0], 0.5)).toBe(0);
+  });
+});
+
+describe('synergies', () => {
+  it('turns on when both families are owned, including evolutions', () => {
+    expect(synergyActive(['bass-drop', 'strobe'], 'bass-strobe')).toBe(true);
+    expect(synergyActive(['earthquake', 'laser-show'], 'bass-strobe')).toBe(true);
+    expect(synergyActive(['bass-drop'], 'bass-strobe')).toBe(false);
+    expect(synergyActive(['ice-bucket', 'bottle-service'], 'bucket-bottle')).toBe(true);
+    expect(synergyActive(['security-call', 'champagne-orbit'], 'guard-bucket')).toBe(true);
+    expect(synergyActive(['disco-ball', 'speaker-blast'], 'disco-strobe')).toBe(false);
   });
 });
 

@@ -6,8 +6,11 @@ import { getCharacter, UPGRADES, getUpgrade, GAME_EVENTS, ACHIEVEMENTS } from '.
 import { PERMANENT_UPGRADES } from '../../data/meta';
 import { saveService } from '../../services/SaveService';
 import { audioService } from '../../services/AudioService';
-import { xpToNextLevel, applyArmor, critMultiplier, calculateClout } from '../balance/formulas';
+import { xpToNextLevel, applyArmor, critMultiplier, calculateClout, distanceToSegment } from '../balance/formulas';
 import { newlyMetAchievements } from '../balance/achievements';
+import { synergyActive } from '../balance/synergies';
+import { bossAttack } from '../boss/attacks';
+import { impactFor } from '../effects/impacts';
 
 // Constants
 const TILE_SIZE = 64;
@@ -36,6 +39,7 @@ interface EnemySprite extends Phaser.Physics.Arcade.Sprite {
   behaviorTimer: number;
   targetX?: number;
   targetY?: number;
+  attackLockUntil?: number;
 }
 
 interface ProjectileSprite extends Phaser.Physics.Arcade.Sprite {
@@ -97,6 +101,15 @@ export class GameScene extends Phaser.Scene {
   
   // Weapon cooldowns
   private weaponCooldowns: Map<string, number> = new Map();
+  private sparkPool: Phaser.GameObjects.Arc[] = [];
+  private shotPool: Phaser.GameObjects.Arc[] = [];
+  private enemyShots: Array<{
+    sprite: Phaser.GameObjects.Arc;
+    vx: number;
+    vy: number;
+    damage: number;
+    expires: number;
+  }> = [];
   
   // Map
   private mapLayer!: Phaser.GameObjects.TileSprite;
@@ -191,7 +204,10 @@ export class GameScene extends Phaser.Scene {
     
     // Create groups
     this.enemies = this.physics.add.group({ runChildUpdate: true });
-    this.projectiles = this.physics.add.group({ runChildUpdate: true });
+    this.projectiles = this.physics.add.group({
+      maxSize: 96,
+      runChildUpdate: false,
+    });
     this.orbitals = this.add.group();
     this.allies = this.physics.add.group({ runChildUpdate: true });
     this.pickups = this.physics.add.group({ runChildUpdate: true });
@@ -210,6 +226,8 @@ export class GameScene extends Phaser.Scene {
     
     // Setup debug
     this.setupDebug();
+    this.initEffectPools();
+    audioService.startMusic();
     
     // A few guests are already on the floor
     for (let i = 0; i < 6; i++) {
@@ -476,6 +494,10 @@ export class GameScene extends Phaser.Scene {
     // Update player
     this.updatePlayer(dt);
     
+    audioService.setMusicEnergy(this.runState.inGameTime / GAME_DURATION_MINUTES);
+    this.updateProjectiles();
+    this.updateEnemyShots(dt);
+    
     // Update weapons
     this.updateWeapons(time);
     
@@ -608,8 +630,6 @@ export class GameScene extends Phaser.Scene {
     const damage = stats.damage * this.getStatMultiplier('damage');
     const speed = (stats.projectileSpeed || 400) * this.getStatMultiplier('projectileSpeed');
     const range = (stats.range || 300) * this.getStatMultiplier('aoe');
-    
-    // Find targets
     const targets = this.findNearestEnemies(count, range);
     
     for (let i = 0; i < count; i++) {
@@ -618,29 +638,65 @@ export class GameScene extends Phaser.Scene {
       const angle = target
         ? Phaser.Math.Angle.Between(this.player.x, this.player.y, target.x, target.y) + spread
         : this.facingAngle + spread;
-      
-      const texture = this.getProjectileTexture(weaponId);
-      const proj = this.projectiles.create(this.player.x, this.player.y, texture) as ProjectileSprite;
-      proj.weaponId = weaponId;
-      proj.damage = damage;
-      proj.piercing = stats.piercing || 0;
-      proj.hitTargets = new Set();
-      proj.speed = speed;
-      proj.lifetime = (range / speed) * 1000;
-      proj.setVelocity(Math.cos(angle) * speed, Math.sin(angle) * speed);
-      proj.setRotation(angle);
-      proj.setDepth(8);
-      
-      // Destroy after lifetime
-      this.time.delayedCall(proj.lifetime, () => {
-        if (proj.active) {
-          // Explosion for bottle-service
-          if (weaponId === 'bottle-service' && stats.aoeRadius) {
-            this.createExplosion(proj.x, proj.y, stats.aoeRadius, damage * 0.5);
-          }
-          proj.destroy();
-        }
-      });
+      this.spawnPlayerProjectile(weaponId, this.player.x, this.player.y, angle, damage, speed, range, stats.piercing || 0);
+    }
+  }
+  
+  private spawnPlayerProjectile(
+    weaponId: string,
+    x: number,
+    y: number,
+    angle: number,
+    damage: number,
+    speed: number,
+    range: number,
+    piercing: number,
+  ): void {
+    const texture = this.getProjectileTexture(weaponId);
+    const proj = this.projectiles.get(x, y, texture) as ProjectileSprite | null;
+    if (!proj) return;
+    proj.setActive(true);
+    proj.setVisible(true);
+    proj.weaponId = weaponId;
+    proj.damage = damage;
+    proj.piercing = piercing;
+    if (!proj.hitTargets) proj.hitTargets = new Set();
+    else proj.hitTargets.clear();
+    proj.speed = speed;
+    proj.lifetime = this.time.now + (range / Math.max(40, speed)) * 1000;
+    proj.setTexture(texture);
+    proj.setTint(getWeapon(weaponId)?.color ?? 0xffffff);
+    proj.setScale(weaponId === 'glow-stick' ? 1.15 : weaponId === 'disco-ball' ? 1.05 : 1);
+    proj.setVelocity(Math.cos(angle) * speed, Math.sin(angle) * speed);
+    proj.setRotation(angle);
+    proj.setDepth(8);
+    const body = proj.body as Phaser.Physics.Arcade.Body | null;
+    if (body) {
+      body.enable = true;
+      body.reset(x, y);
+    }
+  }
+  
+  private releaseProjectile(proj: ProjectileSprite): void {
+    if (!proj.active) return;
+    proj.hitTargets?.clear();
+    proj.setVelocity(0, 0);
+    const body = proj.body as Phaser.Physics.Arcade.Body | null;
+    if (body) body.enable = false;
+    this.projectiles.killAndHide(proj);
+  }
+  
+  private updateProjectiles(): void {
+    const now = this.time.now;
+    const children = this.projectiles.getChildren();
+    for (let i = 0; i < children.length; i++) {
+      const proj = children[i] as ProjectileSprite;
+      if (!proj.active || now < proj.lifetime) continue;
+      if (proj.weaponId === 'bottle-service') {
+        const stats = getWeaponStats(proj.weaponId, this.runState.weapons.get(proj.weaponId) || 1);
+        if (stats.aoeRadius) this.createExplosion(proj.x, proj.y, stats.aoeRadius, proj.damage * 0.5, proj.weaponId);
+      }
+      this.releaseProjectile(proj);
     }
   }
   
@@ -662,7 +718,7 @@ export class GameScene extends Phaser.Scene {
       const e = enemy as EnemySprite;
       const dist = Phaser.Math.Distance.Between(this.player.x, this.player.y, e.x, e.y);
       if (dist <= radius) {
-        this.damageEnemy(e, damage);
+        this.damageEnemy(e, damage, weaponId);
         
         // Knockback
         if (knockback > 0) {
@@ -680,12 +736,28 @@ export class GameScene extends Phaser.Scene {
       }
     });
 
-    // Synergy: bass hits trigger a strobe burst when both are owned
-    const hasStrobe = this.runState.weapons.has('strobe') || this.runState.weapons.has('laser-show');
-    if (hasStrobe && (weaponId === 'bass-drop' || weaponId === 'earthquake')) {
+    if (synergyActive(this.runState.weapons.keys(), 'bass-strobe') && (weaponId === 'bass-drop' || weaponId === 'earthquake')) {
       this.time.delayedCall(180, () => {
-        if (!this.runState.isPaused) this.createStrobeEffect(radius * 0.65);
+        if (this.runEnded || this.runState.isPaused) return;
+        this.createStrobeEffect(radius * 0.65);
+        this.damageRadius(this.player.x, this.player.y, radius * 0.65, damage * 0.45, 'strobe');
       });
+    }
+    if (synergyActive(this.runState.weapons.keys(), 'strobe-glow') && (weaponId === 'strobe' || weaponId === 'laser-show')) {
+      const glow = getWeaponStats('glow-stick', this.runState.weapons.get('glow-stick') || 1);
+      for (let i = 0; i < 4; i++) {
+        const angle = this.facingAngle + (i / 4) * Math.PI * 2;
+        this.spawnPlayerProjectile(
+          'glow-stick',
+          this.player.x,
+          this.player.y,
+          angle,
+          glow.damage * this.getStatMultiplier('damage'),
+          glow.projectileSpeed || 500,
+          glow.range || 250,
+          0,
+        );
+      }
     }
     
     audioService.play('explosion');
@@ -729,8 +801,8 @@ export class GameScene extends Phaser.Scene {
       const enemyAngle = Phaser.Math.Angle.Between(this.player.x, this.player.y, e.x, e.y);
       const angleDiff = Math.abs(Phaser.Math.Angle.Wrap(enemyAngle - angle));
       
-      if (angleDiff < 0.5) { // ~30 degree cone
-        this.damageEnemy(e, damage);
+        if (angleDiff < 0.5) { // ~30 degree cone
+        this.damageEnemy(e, damage, weaponId);
         
         if (knockback > 0) {
           e.setVelocity(
@@ -740,6 +812,16 @@ export class GameScene extends Phaser.Scene {
         }
       }
     });
+
+    if (synergyActive(this.runState.weapons.keys(), 'speaker-bass') && (weaponId === 'speaker-blast' || weaponId === 'wall-of-sound')) {
+      const endX = this.player.x + Math.cos(angle) * range * 0.7;
+      const endY = this.player.y + Math.sin(angle) * range * 0.7;
+      this.time.delayedCall(220, () => {
+        if (this.runEnded) return;
+        this.createBassDropEffect(90);
+        this.damageRadius(endX, endY, 90, damage * 0.5, 'bass-drop');
+      });
+    }
     
     audioService.play('hit');
   }
@@ -808,9 +890,7 @@ export class GameScene extends Phaser.Scene {
       orbital.y = this.player.y + Math.sin(orbital.angle) * orbital.orbitRadius;
       orbital.setRotation(orbital.angle + Math.PI / 2);
       
-      // Synergy: buckets fling bottles when Bottle Toss is also equipped
-      const hasBottles = this.runState.weapons.has('bottle-toss') || this.runState.weapons.has('bottle-service');
-      if (hasBottles && this.time.now - (orbital.getData('bottleAt') as number || 0) > 2200) {
+      if (synergyActive(this.runState.weapons.keys(), 'bucket-bottle') && this.time.now - (orbital.getData('bottleAt') as number || 0) > 2200) {
         if (this.rng.next() < 0.35) {
           this.launchOrbitalBottle(orbital);
         }
@@ -825,7 +905,7 @@ export class GameScene extends Phaser.Scene {
         if (dist < 30) {
           const lastHit = orbital.lastHitTime.get(e) || 0;
           if (this.time.now - lastHit > 500) {
-            this.damageEnemy(e, orbital.damage);
+            this.damageEnemy(e, orbital.damage, orbital.weaponId);
             orbital.lastHitTime.set(e, this.time.now);
             
             // Knockback
@@ -895,19 +975,16 @@ export class GameScene extends Phaser.Scene {
       ? Phaser.Math.Angle.Between(orbital.x, orbital.y, target.x, target.y)
       : orbital.angle;
     const speed = (stats.projectileSpeed || 400) * this.getStatMultiplier('projectileSpeed');
-    const proj = this.projectiles.create(orbital.x, orbital.y, 'projectile-bottle') as ProjectileSprite;
-    proj.weaponId = weaponId;
-    proj.damage = stats.damage * 0.7 * this.getStatMultiplier('damage');
-    proj.piercing = stats.piercing || 0;
-    proj.hitTargets = new Set();
-    proj.speed = speed;
-    proj.lifetime = 800;
-    proj.setVelocity(Math.cos(angle) * speed, Math.sin(angle) * speed);
-    proj.setRotation(angle);
-    proj.setDepth(8);
-    this.time.delayedCall(proj.lifetime, () => {
-      if (proj.active) proj.destroy();
-    });
+    this.spawnPlayerProjectile(
+      weaponId,
+      orbital.x,
+      orbital.y,
+      angle,
+      stats.damage * 0.7 * this.getStatMultiplier('damage'),
+      speed,
+      stats.range || 280,
+      stats.piercing || 0,
+    );
   }
   
   private updateEnemies(dt: number): void {
@@ -956,7 +1033,7 @@ export class GameScene extends Phaser.Scene {
         this.updateBossBehavior(enemy);
       }
 
-      if (this.eventMods.enemySpeed !== 1 && enemy.body) {
+      if (this.eventMods.enemySpeed !== 1 && enemy.body && (enemy.attackLockUntil ?? 0) <= this.time.now) {
         const body = enemy.body as Phaser.Physics.Arcade.Body;
         body.velocity.x *= this.eventMods.enemySpeed;
         body.velocity.y *= this.eventMods.enemySpeed;
@@ -1098,28 +1175,32 @@ export class GameScene extends Phaser.Scene {
     }
     
     const phase = bossData.phases[phaseIndex];
+
+    if ((boss.attackLockUntil ?? 0) > this.time.now) {
+      return;
+    }
     
     // Movement
+    const aimAngle = Phaser.Math.Angle.Between(boss.x, boss.y, this.player.x, this.player.y);
     switch (phase.movementPattern) {
-      case 'chase':
-      case 'aggressive':
-      case 'enraged':
-        const speedMult = phase.movementPattern === 'enraged' ? 1.5 : 1;
-        const angle = Phaser.Math.Angle.Between(boss.x, boss.y, this.player.x, this.player.y);
-        boss.setVelocity(
-          Math.cos(angle) * boss.speed * speedMult,
-          Math.sin(angle) * boss.speed * speedMult
-        );
-        break;
       case 'stationary':
+      case 'expand':
+      case 'pulse':
+      case 'final-form':
         boss.setVelocity(0, 0);
         break;
       case 'slow-chase':
-        const slowAngle = Phaser.Math.Angle.Between(boss.x, boss.y, this.player.x, this.player.y);
-        boss.setVelocity(
-          Math.cos(slowAngle) * boss.speed * 0.5,
-          Math.sin(slowAngle) * boss.speed * 0.5
-        );
+      case 'strategic':
+        boss.setVelocity(Math.cos(aimAngle) * boss.speed * 0.5, Math.sin(aimAngle) * boss.speed * 0.5);
+        break;
+      case 'enraged':
+      case 'desperate':
+      case 'erratic':
+      case 'teleport':
+        boss.setVelocity(Math.cos(aimAngle) * boss.speed * 1.45, Math.sin(aimAngle) * boss.speed * 1.45);
+        break;
+      default:
+        boss.setVelocity(Math.cos(aimAngle) * boss.speed, Math.sin(aimAngle) * boss.speed);
         break;
     }
     
@@ -1132,70 +1213,150 @@ export class GameScene extends Phaser.Scene {
   }
   
   private executeBossAttack(boss: EnemySprite, attack: string): void {
-    switch (attack) {
-      case 'charge':
-        // Fast dash toward player
-        const chargeAngle = Phaser.Math.Angle.Between(boss.x, boss.y, this.player.x, this.player.y);
-        boss.setVelocity(
-          Math.cos(chargeAngle) * 400,
-          Math.sin(chargeAngle) * 400
-        );
-        this.time.delayedCall(500, () => boss.setVelocity(0, 0));
+    const def = bossAttack(attack);
+    const aim = { x: this.player.x, y: this.player.y };
+    const angle = Phaser.Math.Angle.Between(boss.x, boss.y, aim.x, aim.y);
+    boss.setVelocity(0, 0);
+    boss.attackLockUntil = this.time.now + def.windup + (def.effect === 'dash' ? 480 : 80);
+    boss.setTint(0xffffff);
+    audioService.play('telegraph');
+
+    const origin = def.shape === 'player-circle' ? aim : { x: boss.x, y: boss.y };
+    const marker = this.drawTelegraph(origin.x, origin.y, def.shape, def.radius, def.color, angle);
+    const label = this.add.text(origin.x, origin.y - def.radius - 18, def.label, {
+      fontFamily: 'Arial Black, sans-serif',
+      fontSize: '18px',
+      color: '#ffffff',
+      stroke: '#000000',
+      strokeThickness: 4,
+    }).setOrigin(0.5).setDepth(22);
+
+    this.time.delayedCall(def.windup, () => {
+      marker.destroy();
+      label.destroy();
+      if (!boss.active || this.runEnded) return;
+      boss.clearTint();
+      this.resolveBossAttack(boss, attack, aim, angle);
+    });
+  }
+
+  private drawTelegraph(
+    x: number,
+    y: number,
+    shape: string,
+    radius: number,
+    color: number,
+    angle: number,
+  ): Phaser.GameObjects.Graphics {
+    const g = this.add.graphics();
+    g.setDepth(14);
+    g.lineStyle(4, color, 0.95);
+    g.fillStyle(color, 0.14);
+    if (shape === 'line') {
+      const x2 = x + Math.cos(angle) * radius;
+      const y2 = y + Math.sin(angle) * radius;
+      g.lineStyle(10, color, 0.85);
+      g.lineBetween(x, y, x2, y2);
+    } else if (shape === 'spokes') {
+      const count = 8;
+      for (let i = 0; i < count; i++) {
+        const a = (i / count) * Math.PI * 2;
+        g.lineBetween(x, y, x + Math.cos(a) * radius * 0.85, y + Math.sin(a) * radius * 0.85);
+      }
+    } else {
+      g.strokeCircle(x, y, radius);
+      g.fillCircle(x, y, radius);
+    }
+    this.tweens.add({
+      targets: g,
+      alpha: 0.35,
+      duration: 140,
+      yoyo: true,
+      repeat: 2,
+    });
+    return g;
+  }
+
+  private resolveBossAttack(boss: EnemySprite, attack: string, aim: { x: number; y: number }, angle: number): void {
+    const def = bossAttack(attack);
+    const damage = boss.damage * def.damageScale;
+    switch (def.effect) {
+      case 'damage-circle':
+        this.createBassDropEffect(def.radius);
+        this.damagePlayerInRadius(boss.x, boss.y, def.radius, damage);
+        if (def.radius >= 180) this.addScreenShake(0.45);
         break;
-        
-      case 'slam':
-        // AOE attack
-        this.createBassDropEffect(150);
-        this.damagePlayerInRadius(boss.x, boss.y, 150, boss.damage);
-        this.addScreenShake(0.4);
+      case 'damage-at-aim':
+        this.createStrobeEffect(def.radius);
+        this.damagePlayerInRadius(aim.x, aim.y, def.radius, damage);
         break;
-        
-      case 'sound-wave':
-        // Directional attack
-        for (let i = 0; i < 8; i++) {
-          const angle = (i / 8) * Math.PI * 2;
-          this.createProjectileFromEnemy(boss, angle, boss.damage * 0.5);
+      case 'dash':
+        boss.setVelocity(Math.cos(angle) * 420, Math.sin(angle) * 420);
+        this.time.delayedCall(420, () => {
+          if (boss.active) boss.setVelocity(0, 0);
+        });
+        break;
+      case 'beam': {
+        const x2 = boss.x + Math.cos(angle) * def.radius;
+        const y2 = boss.y + Math.sin(angle) * def.radius;
+        const beam = this.add.graphics();
+        beam.lineStyle(14, def.color, 0.8);
+        beam.lineBetween(boss.x, boss.y, x2, y2);
+        beam.setDepth(15);
+        this.tweens.add({ targets: beam, alpha: 0, duration: 180, onComplete: () => beam.destroy() });
+        if (distanceToSegment(this.player.x, this.player.y, boss.x, boss.y, x2, y2) < 36) {
+          this.damagePlayer(damage);
         }
         break;
-        
-      case 'bass-slam':
-        // Large AOE
-        this.createBassDropEffect(200);
-        this.damagePlayerInRadius(boss.x, boss.y, 200, boss.damage * 1.5);
-        this.addScreenShake(0.5);
+      }
+      case 'spokes': {
+        const count = def.spokeCount || 8;
+        for (let i = 0; i < count; i++) {
+          this.createProjectileFromEnemy(boss, (i / count) * Math.PI * 2, Math.max(8, damage));
+        }
         break;
+      }
+      case 'summon': {
+        const id = def.summonId || 'party-crasher';
+        const count = def.summonCount || 2;
+        for (let i = 0; i < count; i++) {
+          const a = (i / count) * Math.PI * 2;
+          this.createEnemy(id, boss.x + Math.cos(a) * 70, boss.y + Math.sin(a) * 70, false);
+        }
+        break;
+      }
     }
   }
   
   private createProjectileFromEnemy(enemy: EnemySprite, angle: number, damage: number): void {
-    const proj = this.add.circle(enemy.x, enemy.y, 8, 0xff0000) as Phaser.GameObjects.Arc & { vel: { x: number; y: number } };
-    proj.vel = { x: Math.cos(angle) * 200, y: Math.sin(angle) * 200 };
-    proj.setDepth(8);
-    
-    const update = () => {
-      if (!proj.active) return;
-      proj.x += proj.vel.x * 0.016;
-      proj.y += proj.vel.y * 0.016;
-      
-      // Check collision with player
-      const dist = Phaser.Math.Distance.Between(proj.x, proj.y, this.player.x, this.player.y);
-      if (dist < 20) {
-        this.damagePlayer(damage);
-        proj.destroy();
-        return;
+    const sprite = this.shotPool.find((shot) => !shot.active);
+    if (!sprite) return;
+    this.tweens.killTweensOf(sprite);
+    sprite.setActive(true).setVisible(true).setAlpha(1).setPosition(enemy.x, enemy.y).setFillStyle(0xff4466);
+    this.enemyShots.push({
+      sprite,
+      vx: Math.cos(angle) * 220,
+      vy: Math.sin(angle) * 220,
+      damage,
+      expires: this.time.now + 2800,
+    });
+  }
+
+  private updateEnemyShots(dt: number): void {
+    for (let i = this.enemyShots.length - 1; i >= 0; i--) {
+      const shot = this.enemyShots[i];
+      shot.sprite.x += shot.vx * dt;
+      shot.sprite.y += shot.vy * dt;
+      const dist = Phaser.Math.Distance.Between(shot.sprite.x, shot.sprite.y, this.player.x, this.player.y);
+      const expired = this.time.now > shot.expires
+        || shot.sprite.x < 0 || shot.sprite.y < 0
+        || shot.sprite.x > WORLD_WIDTH || shot.sprite.y > WORLD_HEIGHT;
+      if (dist < 18) this.damagePlayer(shot.damage);
+      if (dist < 18 || expired) {
+        shot.sprite.setActive(false).setVisible(false);
+        this.enemyShots.splice(i, 1);
       }
-      
-      // Out of bounds
-      if (proj.x < 0 || proj.x > WORLD_WIDTH || proj.y < 0 || proj.y > WORLD_HEIGHT) {
-        proj.destroy();
-        return;
-      }
-      
-      this.time.delayedCall(16, update);
-    };
-    
-    this.time.delayedCall(16, update);
-    this.time.delayedCall(5000, () => proj.destroy());
+    }
   }
   
   private enemyRangedAttack(enemy: EnemySprite): void {
@@ -1530,19 +1691,22 @@ export class GameScene extends Phaser.Scene {
     
     if (proj.hitTargets.has(e)) return;
     
-    this.damageEnemy(e, proj.damage);
+    this.damageEnemy(e, proj.damage, proj.weaponId);
     proj.hitTargets.add(e);
+    if (proj.weaponId === 'disco-ball' && synergyActive(this.runState.weapons.keys(), 'disco-strobe')) {
+      this.createStrobeEffect(70);
+      this.damageRadius(e.x, e.y, 70, proj.damage * 0.35, 'strobe');
+    }
     
     if (proj.piercing <= 0 || proj.hitTargets.size > proj.piercing) {
-      // Check for explosion
       const weapon = getWeapon(proj.weaponId);
       if (weapon && (proj.weaponId === 'bottle-toss' || proj.weaponId === 'bottle-service')) {
         const stats = getWeaponStats(proj.weaponId, this.runState.weapons.get(proj.weaponId) || 1);
         if (stats.aoeRadius) {
-          this.createExplosion(proj.x, proj.y, stats.aoeRadius, proj.damage * 0.5);
+          this.createExplosion(proj.x, proj.y, stats.aoeRadius, proj.damage * 0.5, proj.weaponId);
         }
       }
-      proj.destroy();
+      this.releaseProjectile(proj);
     }
   }
   
@@ -1554,7 +1718,10 @@ export class GameScene extends Phaser.Scene {
     const e = enemy as unknown as EnemySprite;
     
     if (this.time.now - a.lastAttack > a.attackCooldown) {
-      this.damageEnemy(e, a.damage);
+      this.damageEnemy(e, a.damage, 'security-call');
+      if (synergyActive(this.runState.weapons.keys(), 'guard-bucket')) {
+        this.damageRadius(e.x, e.y, 56, a.damage * 0.4, 'ice-bucket');
+      }
       a.lastAttack = this.time.now;
     }
   }
@@ -1625,7 +1792,7 @@ export class GameScene extends Phaser.Scene {
     }
   }
   
-  private damageEnemy(enemy: EnemySprite, baseDamage: number): void {
+  private damageEnemy(enemy: EnemySprite, baseDamage: number, sourceId?: string): void {
     // Critical hit
     const critChance = this.getStatValue('critChance');
     const isCrit = this.rng.next() < critChance;
@@ -1657,8 +1824,8 @@ export class GameScene extends Phaser.Scene {
       this.createDamageNumber(enemy.x, enemy.y, Math.floor(damage), isCrit);
     }
     
-    // Hit effect
-    this.createHitEffect(enemy.x, enemy.y);
+    const impact = impactFor(sourceId);
+    this.spawnSparks(enemy.x, enemy.y, impact.color, impact.sparks);
     
     // Check death
     if (enemy.health <= 0) {
@@ -1755,15 +1922,18 @@ export class GameScene extends Phaser.Scene {
     }
   }
   
-  private createExplosion(x: number, y: number, radius: number, damage: number): void {
-    // Damage enemies
+  private damageRadius(x: number, y: number, radius: number, damage: number, sourceId?: string): void {
     this.enemies.getChildren().forEach((enemy) => {
       const e = enemy as EnemySprite;
-      const dist = Phaser.Math.Distance.Between(x, y, e.x, e.y);
-      if (dist <= radius) {
-        this.damageEnemy(e, damage);
+      if (!e.active) return;
+      if (Phaser.Math.Distance.Between(x, y, e.x, e.y) <= radius) {
+        this.damageEnemy(e, damage, sourceId);
       }
     });
+  }
+
+  private createExplosion(x: number, y: number, radius: number, damage: number, sourceId?: string): void {
+    this.damageRadius(x, y, radius, damage, sourceId);
     
     // Visual
     const explosion = this.add.circle(x, y, radius, 0xff6600, 0.5);
@@ -1833,12 +2003,16 @@ export class GameScene extends Phaser.Scene {
     if (choices.length === 0) {
       this.pendingLevels = 0;
       this.runState.isLevelingUp = false;
-      if (!this.runEnded) this.physics.resume();
+      if (!this.runEnded) {
+        this.physics.resume();
+        audioService.setMusicPaused(false);
+      }
       return;
     }
     
     this.runState.isLevelingUp = true;
     this.physics.pause();
+    audioService.setMusicPaused(true);
     this.events.emit('levelUp', this.runState.level, choices);
     audioService.play('levelUp');
   }
@@ -1961,6 +2135,7 @@ export class GameScene extends Phaser.Scene {
     } else {
       this.runState.isLevelingUp = false;
       this.physics.resume();
+      audioService.setMusicPaused(false);
     }
     audioService.play('select');
   }
@@ -2095,37 +2270,41 @@ export class GameScene extends Phaser.Scene {
   }
   
   // Visual effects
-  private createHitEffect(x: number, y: number): void {
-    const flash = this.add.sprite(x, y, 'hit-flash');
-    flash.setDepth(15);
-    flash.setScale(0.5);
-    
-    this.tweens.add({
-      targets: flash,
-      alpha: 0,
-      scale: 1,
-      duration: 100,
-      onComplete: () => flash.destroy(),
-    });
+  private initEffectPools(): void {
+    for (let i = 0; i < 56; i++) {
+      const spark = this.add.circle(-200, -200, 4, 0xffffff);
+      spark.setActive(false).setVisible(false).setDepth(16);
+      this.sparkPool.push(spark);
+    }
+    for (let i = 0; i < 40; i++) {
+      const shot = this.add.circle(-200, -200, 7, 0xff4466);
+      shot.setActive(false).setVisible(false).setDepth(8);
+      this.shotPool.push(shot);
+    }
+  }
+
+  private spawnSparks(x: number, y: number, color: number, count: number): void {
+    const n = Math.min(count, 8);
+    for (let i = 0; i < n; i++) {
+      const spark = this.sparkPool.find((item) => !item.active);
+      if (!spark) return;
+      this.tweens.killTweensOf(spark);
+      spark.setActive(true).setVisible(true).setAlpha(1).setScale(1).setPosition(x, y).setFillStyle(color);
+      const angle = (i / n) * Math.PI * 2;
+      this.tweens.add({
+        targets: spark,
+        x: x + Math.cos(angle) * 26,
+        y: y + Math.sin(angle) * 26,
+        alpha: 0,
+        scale: 0.4,
+        duration: 220,
+        onComplete: () => spark.setActive(false).setVisible(false),
+      });
+    }
   }
   
   private createDeathEffect(x: number, y: number, color: number): void {
-    for (let i = 0; i < 8; i++) {
-      const angle = (i / 8) * Math.PI * 2;
-      const particle = this.add.circle(x, y, 6, color);
-      particle.setDepth(15);
-      
-      this.tweens.add({
-        targets: particle,
-        x: x + Math.cos(angle) * 40,
-        y: y + Math.sin(angle) * 40,
-        alpha: 0,
-        scale: 0,
-        duration: 300,
-        ease: 'Quad.easeOut',
-        onComplete: () => particle.destroy(),
-      });
-    }
+    this.spawnSparks(x, y, color, 6);
   }
   
   private createSpawnEffect(x: number, y: number, color: number): void {
@@ -2251,8 +2430,10 @@ export class GameScene extends Phaser.Scene {
     
     if (this.runState.isPaused) {
       this.physics.pause();
+      audioService.setMusicPaused(true);
     } else {
       this.physics.resume();
+      audioService.setMusicPaused(false);
     }
   }
   
@@ -2274,6 +2455,7 @@ export class GameScene extends Phaser.Scene {
     if (this.runEnded) return;
     this.runEnded = true;
     this.physics.pause();
+    audioService.stopMusic();
     
     // Calculate clout earned
     const cloutMultiplier = this.getStatMultiplier('cloutBonus');
@@ -2340,8 +2522,13 @@ export class GameScene extends Phaser.Scene {
   }
   
   quitToMenu(): void {
+    audioService.stopMusic();
     this.scene.stop('UIScene');
     this.scene.start('MenuScene');
+  }
+
+  shutdown(): void {
+    audioService.stopMusic();
   }
   
   // Debug functions

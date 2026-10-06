@@ -1,6 +1,6 @@
 import { saveService } from './SaveService';
 
-type SoundType = 'hit' | 'playerHit' | 'xp' | 'levelUp' | 'bossWarning' | 'select' | 'death' | 'explosion' | 'evolve';
+type SoundType = 'hit' | 'playerHit' | 'xp' | 'levelUp' | 'bossWarning' | 'select' | 'death' | 'explosion' | 'evolve' | 'telegraph';
 
 export class AudioService {
   private static instance: AudioService;
@@ -9,6 +9,11 @@ export class AudioService {
   private sfxGain: GainNode | null = null;
   private musicGain: GainNode | null = null;
   private initialized = false;
+  private musicOn = false;
+  private musicPaused = false;
+  private musicTimer: ReturnType<typeof setTimeout> | null = null;
+  private musicStep = 0;
+  private musicEnergy = 0;
   
   private constructor() {}
   
@@ -86,6 +91,9 @@ export class AudioService {
         case 'evolve':
           this.playSequence([300, 400, 500, 700, 900], 0.08, 'sine', 0.5);
           break;
+        case 'telegraph':
+          this.playTone(520, 0.07, 'square', 0.12);
+          break;
       }
     } catch (e) {
       // Ignore audio errors
@@ -131,6 +139,72 @@ export class AudioService {
     });
   }
   
+  startMusic(): void {
+    this.resume();
+    if (!this.ctx || !this.musicGain || this.musicOn) return;
+    this.musicOn = true;
+    this.musicPaused = false;
+    this.musicStep = 0;
+    this.scheduleMusic();
+  }
+
+  stopMusic(): void {
+    this.musicOn = false;
+    this.musicPaused = false;
+    this.clearMusicTimer();
+  }
+
+  setMusicPaused(paused: boolean): void {
+    if (!this.musicOn) return;
+    this.musicPaused = paused;
+    this.clearMusicTimer();
+    if (!paused) this.scheduleMusic();
+  }
+
+  setMusicEnergy(energy: number): void {
+    this.musicEnergy = Math.max(0, Math.min(1, energy));
+  }
+
+  private clearMusicTimer(): void {
+    if (this.musicTimer !== null) {
+      clearTimeout(this.musicTimer);
+      this.musicTimer = null;
+    }
+  }
+
+  private scheduleMusic(): void {
+    if (!this.musicOn || this.musicPaused || !this.ctx || !this.musicGain) return;
+    const bpm = 108 + this.musicEnergy * 16;
+    const eighth = 60 / bpm / 2;
+    const step = this.musicStep % 16;
+    if (step % 4 === 0) this.playMusicTone(52, 0.12, 'sine', 0.55);
+    if (step % 2 === 0) this.playMusicTone(1800, 0.03, 'square', 0.04);
+    if (this.musicEnergy > 0.45 && (step === 4 || step === 12)) {
+      this.playMusicTone(90, 0.08, 'triangle', 0.2);
+    }
+    const bass = [55, 55, 65, 49, 55, 73, 65, 49];
+    if (step % 2 === 0) {
+      this.playMusicTone(bass[Math.floor(step / 2) % bass.length], 0.16, 'triangle', 0.16);
+    }
+    if (step === 6 || step === 14) this.playMusicTone(220 + this.musicEnergy * 40, 0.07, 'square', 0.045);
+    this.musicStep++;
+    this.musicTimer = setTimeout(() => this.scheduleMusic(), eighth * 1000);
+  }
+
+  private playMusicTone(freq: number, duration: number, type: OscillatorType, volume: number): void {
+    if (!this.ctx || !this.musicGain) return;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(volume, this.ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(this.musicGain);
+    osc.start(this.ctx.currentTime);
+    osc.stop(this.ctx.currentTime + duration);
+  }
+
   private playNoise(duration: number, volume: number): void {
     if (!this.ctx || !this.sfxGain) return;
     

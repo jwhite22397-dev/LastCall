@@ -41,6 +41,22 @@ export function upgradeCost(baseCost: number, currentLevel: number): number {
   return Math.floor(baseCost * Math.pow(1.65, Math.max(0, currentLevel)));
 }
 
+export function distanceToSegment(
+  px: number,
+  py: number,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+): number {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const len2 = dx * dx + dy * dy;
+  if (len2 === 0) return Math.hypot(px - x1, py - y1);
+  const t = Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / len2));
+  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+}
+
 export function weightedIndex(weights: number[], roll: number): number {
   const total = weights.reduce((sum, w) => sum + w, 0);
   if (total <= 0 || weights.length === 0) return 0;
